@@ -2,7 +2,8 @@ use super::membarrier;
 use super::tls::{Thread, ThreadLocal};
 use super::utils::CachePadded;
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -27,6 +28,13 @@ pub struct Collector {
     /// exiting.
     reservations: ThreadLocal<CachePadded<Reservation>>,
 
+    /// Per-thread condemned list of allocations to relinquish.
+    ///
+    /// Freeing an entire batch at once to the allocator can come with large overhead (especially
+    /// from overflowing the t-cache), so avoiding batch deallocations can be advantageous for
+    /// performance.
+    condemned: ThreadLocal<CachePadded<RefCell<VecDeque<Entry>>>>,
+
     /// A unique identifier for a collector.
     pub(crate) id: usize,
 
@@ -45,6 +53,7 @@ impl Collector {
         Self {
             id: ID.fetch_add(1, Ordering::Relaxed),
             reservations: ThreadLocal::with_capacity(threads),
+            condemned: ThreadLocal::with_capacity(threads),
             batches: ThreadLocal::with_capacity(threads),
             batch_size: batch_size.next_power_of_two(),
         }
@@ -74,6 +83,18 @@ impl Collector {
     /// must only be called if the current thread is inactive.
     #[inline]
     pub unsafe fn enter(&self, reservation: &Reservation) {
+        #[cfg(feature = "amortized-free-guard")]
+        {
+            if let Some(condemned) = unsafe { self.condemned.load(Thread::current()) }
+                .borrow_mut()
+                .pop_front()
+            {
+                unsafe {
+                    (condemned.reclaim)(condemned.ptr.cast(), crate::Collector::from_raw(self))
+                };
+            }
+        }
+
         // Mark the current thread as active.
         reservation
             .head
@@ -166,6 +187,18 @@ impl Collector {
         reclaim: unsafe fn(*mut T, &crate::Collector),
         thread: Thread,
     ) {
+        #[cfg(feature = "amortized-free-retire")]
+        {
+            if let Some(condemned) = unsafe { self.condemned.load(Thread::current()) }
+                .borrow_mut()
+                .pop_front()
+            {
+                unsafe {
+                    (condemned.reclaim)(condemned.ptr.cast(), crate::Collector::from_raw(self))
+                };
+            }
+        }
+
         // Safety: The caller guarantees we have unique access to the batch.
         let local_batch = unsafe { self.batches.load(thread).get() };
 
@@ -449,6 +482,16 @@ impl Collector {
             // Safety: The caller guarantees we have unique access to the batch.
             unsafe { (*local_batch).batch = ptr::null_mut() };
         }
+
+        #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
+        {
+            for condemned in unsafe { self.condemned.iter() } {
+                // Free all condemned resources remaining.
+                for entry in condemned.borrow_mut().drain(..) {
+                    unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self)) };
+                }
+            }
+        }
     }
 
     /// Free a batch of objects.
@@ -463,9 +506,20 @@ impl Collector {
     /// through any recursive calls.
     #[inline]
     unsafe fn free_batch(&self, batch: *mut Batch) {
-        // Safety: We have a unique reference to the batch.
-        for entry in unsafe { (*batch).entries.iter_mut() } {
-            unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self)) };
+        #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
+        {
+            // Safety: We have a unique reference to the batch.
+            unsafe { self.condemned.load(Thread::current()) }
+                .borrow_mut()
+                .extend(unsafe { &mut (*batch).entries }.drain(..));
+        }
+
+        #[cfg(not(any(feature = "amortized-free-guard", feature = "amortized-free-retire")))]
+        {
+            // Safety: We have a unique reference to the batch.
+            for entry in unsafe { (*batch).entries.iter_mut() } {
+                unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self)) };
+            }
         }
 
         unsafe { LocalBatch::free(batch) };

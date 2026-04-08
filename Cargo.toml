@@ -22,6 +22,10 @@ default = ["fast-barrier"]
 # Enables runtime detection of fast memory barriers on Linux and Windows.
 fast-barrier = ["windows-sys", "libc"]
 
+# Enables amortized free capabilities.
+amortized-free-guard = []
+amortized-free-retire = []
+
 [dev-dependencies]
 criterion = "0.7.0"
 crossbeam-epoch = "0.9.8"
