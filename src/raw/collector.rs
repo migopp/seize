@@ -2,7 +2,7 @@ use super::membarrier;
 use super::tls::{Thread, ThreadLocal};
 use super::utils::CachePadded;
 
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
@@ -33,7 +33,7 @@ pub struct Collector {
     /// Freeing an entire batch at once to the allocator can come with large overhead (especially
     /// from overflowing the t-cache), so avoiding batch deallocations can be advantageous for
     /// performance.
-    condemned: ThreadLocal<CachePadded<RefCell<VecDeque<Entry>>>>,
+    condemned_batches: ThreadLocal<CachePadded<UnsafeCell<VecDeque<VecDeque<Entry>>>>>,
 
     /// A unique identifier for a collector.
     pub(crate) id: usize,
@@ -53,9 +53,27 @@ impl Collector {
         Self {
             id: ID.fetch_add(1, Ordering::Relaxed),
             reservations: ThreadLocal::with_capacity(threads),
-            condemned: ThreadLocal::with_capacity(threads),
+            condemned_batches: ThreadLocal::with_capacity(threads),
             batches: ThreadLocal::with_capacity(threads),
             batch_size: batch_size.next_power_of_two(),
+        }
+    }
+
+    /// Frees one entry in the condemned list of the current thread.
+    #[inline]
+    fn free_one(&self) {
+        // https://github.com/ibraheemdev/seize/blob/pool/src/raw.rs#L716
+        let condemned_batches =
+            unsafe { &mut *self.condemned_batches.load(Thread::current()).get() };
+        let Some(batch) = condemned_batches.front_mut() else {
+            return;
+        };
+        let entry = unsafe { batch.pop_front().unwrap_unchecked() };
+        unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self)) };
+
+        // Sorry.
+        if batch.is_empty() {
+            condemned_batches.pop_front();
         }
     }
 
@@ -85,14 +103,7 @@ impl Collector {
     pub unsafe fn enter(&self, reservation: &Reservation) {
         #[cfg(feature = "amortized-free-guard")]
         {
-            if let Some(condemned) = unsafe { self.condemned.load(Thread::current()) }
-                .borrow_mut()
-                .pop_front()
-            {
-                unsafe {
-                    (condemned.reclaim)(condemned.ptr.cast(), crate::Collector::from_raw(self))
-                };
-            }
+            self.free_one();
         }
 
         // Mark the current thread as active.
@@ -189,14 +200,7 @@ impl Collector {
     ) {
         #[cfg(feature = "amortized-free-retire")]
         {
-            if let Some(condemned) = unsafe { self.condemned.load(Thread::current()) }
-                .borrow_mut()
-                .pop_front()
-            {
-                unsafe {
-                    (condemned.reclaim)(condemned.ptr.cast(), crate::Collector::from_raw(self))
-                };
-            }
+            self.free_one();
         }
 
         // Safety: The caller guarantees we have unique access to the batch.
@@ -485,10 +489,14 @@ impl Collector {
 
         #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
         {
-            for condemned in unsafe { self.condemned.iter() } {
-                // Free all condemned resources remaining.
-                for entry in condemned.borrow_mut().drain(..) {
-                    unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self)) };
+            // Free all condemned resources remaining.
+            for t_condemned_batches in unsafe { self.condemned_batches.iter() } {
+                for mut condemned_batch in unsafe { &mut *t_condemned_batches.get() }.drain(..) {
+                    for entry in condemned_batch.drain(..) {
+                        unsafe {
+                            (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self))
+                        };
+                    }
                 }
             }
         }
@@ -509,9 +517,11 @@ impl Collector {
         #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
         {
             // Safety: We have a unique reference to the batch.
-            unsafe { self.condemned.load(Thread::current()) }
-                .borrow_mut()
-                .extend(unsafe { &mut (*batch).entries }.drain(..));
+            unsafe { &mut *self.condemned_batches.load(Thread::current()).get() }.push_back(
+                unsafe { &mut (*batch).entries }
+                    .drain(..)
+                    .collect::<VecDeque<_>>(),
+            );
         }
 
         #[cfg(not(any(feature = "amortized-free-guard", feature = "amortized-free-retire")))]
