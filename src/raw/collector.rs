@@ -87,6 +87,7 @@ impl Collector {
         let batch = unsafe { &mut *batch };
         batch.free_one(self);
         if batch.is_empty() {
+            batches.pop_front();
             unsafe { LocalBatch::free(batch) };
         }
     }
