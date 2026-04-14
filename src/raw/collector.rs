@@ -3,10 +3,12 @@ use super::tls::{Thread, ThreadLocal};
 use super::utils::CachePadded;
 
 use std::cell::{Cell, UnsafeCell};
-use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+#[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
+use std::collections::VecDeque;
 
 /// Fast and efficient concurrent memory reclamation.
 ///
@@ -33,7 +35,8 @@ pub struct Collector {
     /// Freeing an entire batch at once to the allocator can come with large overhead (especially
     /// from overflowing the t-cache), so avoiding batch deallocations can be advantageous for
     /// performance.
-    condemned_batches: ThreadLocal<CachePadded<UnsafeCell<VecDeque<VecDeque<Entry>>>>>,
+    #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
+    condemned_batches: ThreadLocal<CachePadded<UnsafeCell<VecDeque<*mut Batch>>>>,
 
     /// A unique identifier for a collector.
     pub(crate) id: usize,
@@ -50,30 +53,41 @@ impl Collector {
         // A counter for collector IDs.
         static ID: AtomicUsize = AtomicUsize::new(0);
 
-        Self {
-            id: ID.fetch_add(1, Ordering::Relaxed),
-            reservations: ThreadLocal::with_capacity(threads),
-            condemned_batches: ThreadLocal::with_capacity(threads),
-            batches: ThreadLocal::with_capacity(threads),
-            batch_size: batch_size.next_power_of_two(),
+        #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
+        {
+            Self {
+                id: ID.fetch_add(1, Ordering::Relaxed),
+                reservations: ThreadLocal::with_capacity(threads),
+                condemned_batches: ThreadLocal::with_capacity(threads),
+                batches: ThreadLocal::with_capacity(threads),
+                batch_size: batch_size.next_power_of_two(),
+            }
+        }
+
+        #[cfg(not(any(feature = "amortized-free-guard", feature = "amortized-free-retire")))]
+        {
+            Self {
+                id: ID.fetch_add(1, Ordering::Relaxed),
+                reservations: ThreadLocal::with_capacity(threads),
+                batches: ThreadLocal::with_capacity(threads),
+                batch_size: batch_size.next_power_of_two(),
+            }
         }
     }
 
     /// Frees one entry in the condemned list of the current thread.
+    #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
     #[inline]
     fn free_one(&self) {
         // https://github.com/ibraheemdev/seize/blob/pool/src/raw.rs#L716
-        let condemned_batches =
-            unsafe { &mut *self.condemned_batches.load(Thread::current()).get() };
-        let Some(batch) = condemned_batches.front_mut() else {
+        let batches = unsafe { &mut *self.condemned_batches.load(Thread::current()).get() };
+        let Some(batch) = batches.front().and_then(|b| Some(*b)) else {
             return;
         };
-        let entry = unsafe { batch.pop_front().unwrap_unchecked() };
-        unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self)) };
-
-        // Sorry.
+        let batch = unsafe { &mut *batch };
+        batch.free_one(self);
         if batch.is_empty() {
-            condemned_batches.pop_front();
+            unsafe { LocalBatch::free(batch) };
         }
     }
 
@@ -490,13 +504,11 @@ impl Collector {
         #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
         {
             // Free all condemned resources remaining.
-            for t_condemned_batches in unsafe { self.condemned_batches.iter() } {
-                for mut condemned_batch in unsafe { &mut *t_condemned_batches.get() }.drain(..) {
-                    for entry in condemned_batch.drain(..) {
-                        unsafe {
-                            (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self))
-                        };
-                    }
+            for batches in unsafe { self.condemned_batches.iter() } {
+                for batch_raw in unsafe { &mut *batches.get() }.drain(..) {
+                    let batch = unsafe { &mut *batch_raw };
+                    batch.free_all(self);
+                    unsafe { LocalBatch::free(batch_raw) };
                 }
             }
         }
@@ -517,11 +529,7 @@ impl Collector {
         #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
         {
             // Safety: We have a unique reference to the batch.
-            unsafe { &mut *self.condemned_batches.load(Thread::current()).get() }.push_back(
-                unsafe { &mut (*batch).entries }
-                    .drain(..)
-                    .collect::<VecDeque<_>>(),
-            );
+            unsafe { &mut *self.condemned_batches.load(Thread::current()).get() }.push_back(batch);
         }
 
         #[cfg(not(any(feature = "amortized-free-guard", feature = "amortized-free-retire")))]
@@ -530,9 +538,8 @@ impl Collector {
             for entry in unsafe { (*batch).entries.iter_mut() } {
                 unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(self)) };
             }
+            unsafe { LocalBatch::free(batch) };
         }
-
-        unsafe { LocalBatch::free(batch) };
     }
 }
 
@@ -594,6 +601,31 @@ impl Batch {
             entries: Vec::with_capacity(capacity),
             active: AtomicUsize::new(0),
         }
+    }
+
+    /// Free one element of the batch.
+    #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
+    #[inline]
+    fn free_one(&mut self, collector: &Collector) {
+        if let Some(entry) = self.entries.pop() {
+            unsafe { (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(collector)) };
+        }
+    }
+
+    /// Free all remaining elements of the batch.
+    #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
+    #[inline]
+    fn free_all(&mut self, collector: &Collector) {
+        self.entries.drain(..).for_each(|entry| unsafe {
+            (entry.reclaim)(entry.ptr.cast(), crate::Collector::from_raw(collector));
+        });
+    }
+
+    /// Check if this batch has any unfreed elements remaining.
+    #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
