@@ -18,6 +18,7 @@ windows-sys = { version = ">=0.52, <=0.61", features = ["Win32_System_Threading"
 
 [features]
 default = ["fast-barrier"]
+stat-garbage = []
 
 # Enables runtime detection of fast memory barriers on Linux and Windows.
 fast-barrier = ["windows-sys", "libc"]

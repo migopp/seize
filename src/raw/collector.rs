@@ -2,6 +2,7 @@ use super::membarrier;
 use super::tls::{Thread, ThreadLocal};
 use super::utils::CachePadded;
 
+use core::sync::atomic::AtomicU64;
 use std::cell::{Cell, UnsafeCell};
 use std::ptr;
 use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
@@ -16,6 +17,8 @@ use std::collections::VecDeque;
 /// [in this paper](https://arxiv.org/pdf/2108.02763.pdf). Specifically,
 /// this module implements the Hyaline-1 variant of the algorithm.
 pub struct Collector {
+    garbage: CachePadded<AtomicU64>,
+
     /// Per-thread batches of retired nodes.
     ///
     /// Retired values are added to thread-local batches before starting the
@@ -56,6 +59,9 @@ impl Collector {
         #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
         {
             Self {
+                garbage: CachePadded {
+                    value: AtomicU64::new(0),
+                },
                 id: ID.fetch_add(1, Ordering::Relaxed),
                 reservations: ThreadLocal::with_capacity(threads),
                 condemned_batches: ThreadLocal::with_capacity(threads),
@@ -67,6 +73,9 @@ impl Collector {
         #[cfg(not(any(feature = "amortized-free-guard", feature = "amortized-free-retire")))]
         {
             Self {
+                garbage: CachePadded {
+                    value: AtomicU64::new(0),
+                },
                 id: ID.fetch_add(1, Ordering::Relaxed),
                 reservations: ThreadLocal::with_capacity(threads),
                 batches: ThreadLocal::with_capacity(threads),
@@ -358,6 +367,21 @@ impl Collector {
         // in this batch the next time it becomes active.
         atomic::fence(Ordering::Acquire);
 
+        if cfg!(feature = "stat-garbage") {
+            let count = unsafe { batch.as_ref() }.unwrap().entries.len() as u64;
+            self.garbage
+                .value
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |garbage| {
+                    let old_count = garbage >> 32;
+                    let old_max = garbage as u32;
+
+                    let new_count = old_count + count;
+                    let new_max = old_max.max(new_count as u32);
+                    Some(new_count << 32 | (new_max as u64))
+                })
+                .unwrap();
+        }
+
         let mut active = 0;
 
         // Add the batch to the reservation lists of any active threads.
@@ -527,6 +551,20 @@ impl Collector {
     /// through any recursive calls.
     #[inline]
     unsafe fn free_batch(&self, batch: *mut Batch) {
+        if cfg!(feature = "stat-garbage") {
+            let count = unsafe { batch.as_ref() }.unwrap().entries.len() as u64;
+            self.garbage
+                .value
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |garbage| {
+                    let old_count = garbage >> 32;
+                    let old_max = garbage as u32;
+
+                    let new_count = old_count - count;
+                    Some(new_count << 32 | (old_max as u64))
+                })
+                .unwrap();
+        }
+
         #[cfg(any(feature = "amortized-free-guard", feature = "amortized-free-retire"))]
         {
             // Safety: We have a unique reference to the batch.
