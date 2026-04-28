@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 /// [in this paper](https://arxiv.org/pdf/2108.02763.pdf). Specifically,
 /// this module implements the Hyaline-1 variant of the algorithm.
 pub struct Collector {
-    garbage: CachePadded<AtomicU64>,
+    pub(crate) garbage: CachePadded<AtomicU64>,
 
     /// Per-thread batches of retired nodes.
     ///

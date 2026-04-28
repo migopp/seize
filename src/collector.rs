@@ -1,6 +1,7 @@
 use crate::raw::{self, membarrier, Thread};
 use crate::{LocalGuard, OwnedGuard};
 
+use core::sync::atomic::Ordering;
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -51,6 +52,10 @@ impl Collector {
         Self {
             raw: raw::Collector::new(cpus, batch_size),
         }
+    }
+
+    pub fn garbage(&self) -> u32 {
+        self.raw.garbage.value.load(Ordering::Relaxed) as u32
     }
 
     /// Sets the number of objects that must be in a batch before reclamation is
